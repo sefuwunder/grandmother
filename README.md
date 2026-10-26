@@ -2,9 +2,10 @@
 
 A Grandmother-style semi-modular analog synthesizer in Rust + SDL2.
 Two VCOs, a Moog-style 4-pole ladder filter, dual ADSR envelopes, an LFO,
-an arpeggiator, spring-style reverb, and a 43-point patch bay with
-normalized routing — all evaluated per sample, so audio-rate patching
-(oscillator into filter cutoff, noise into pitch) works.
+an arpeggiator, a 16-step sequencer, spring-style reverb, 8 preset slots,
+MIDI input, and a 43-point patch bay with normalized routing — all
+evaluated per sample, so audio-rate patching (oscillator into filter
+cutoff, noise into pitch) works.
 
 An homage to the Moog Grandmother's layout and signal flow, written from
 scratch. Not affiliated with Moog Music.
@@ -94,7 +95,40 @@ included — there is no sequencer transport or rear panel yet.
 - **UTILITIES**: ATT (bipolar, center = silence), HP CUTOFF (log).
 - **REVERB**: MIX (spring-tank-style DSP network, not a physical tank).
 - **ARPEGGIATOR**: on/off, UP / DOWN / UP-DN / RAND, RATE, OCT (1–3).
+- **SEQUENCER**: 16 steps, SEQ RATE (steps/sec), PLAY / REC / GATE /
+  ACCENT / SEQ CLR.
 - **OUTPUT**: MASTER, GLIDE.
+
+## Sequencer
+
+16 steps, each with a note, a gate, and an accent. PLAY starts from
+step 0; while playing, the sequencer owns the voice — rest steps
+silence it rather than falling through to held keys, and the
+arpeggiator is overridden. Accented steps play at full velocity, plain
+steps at 0.7 (visible on the KB VEL output). Click a step to select it;
+GATE and ACCENT edit the selected step, live, even while playing. REC
+arms note entry from step 0: played notes (computer keys, screen keys,
+or MIDI) fill steps and advance, switching off after step 16. Note
+entry only happens while REC is armed, so casual playing never
+overwrites steps. The default pattern is a C4 pulse with accents on
+steps 1, 5, 9, 13.
+
+## Presets
+
+8 slots in the title bar. Click a slot to load it; SAVE writes the
+current state (all knobs, patch cables, sequencer steps) to the
+selected slot. Presets live in `~/.grandmother/presets.txt` as plain
+text — one `[slot n]` section per occupied slot — so they stay
+readable and hand-editable. Loading a preset stops the sequencer.
+
+## MIDI input
+
+Connects to the first available ALSA input port and reconnects
+automatically when ports appear or change; the footer shows the port
+name, or `-` when none is present. Notes play with velocity (which
+also feeds KB VEL), pitch bend covers ±2 semitones, and the mod wheel
+(CC 1) scales all LFO modulation depths. Build needs libasound2-dev;
+runtime needs libasound2.
 
 ## Playing
 
@@ -127,13 +161,17 @@ cargo test --release
 
 Covers oscillators, the ladder (DC, cutoff sweep, bounded resonance),
 the 1-pole high-pass, envelopes, the LFO, the reverb tail, the patch
-bay (including mult routing), the arpeggiator, the voice (silence,
-release, patch-changes-sound, LFO-triggered gate, trigger in, mixer
-channel in, VCA in, attenuator, S/H), and the UI handlers (knob drag,
-jack patching including mult jacks, computer keys).
+bay (including mult routing), the arpeggiator, the sequencer (step
+advance, accents, rests, REC entry), presets (round-trip, sections,
+lenient parsing), MIDI message parsing and application, the voice
+(silence, release, patch-changes-sound, LFO-triggered gate, trigger in,
+mixer channel in, VCA in, attenuator, S/H, sequencer playback and
+rest-override, pitch bend), and the UI handlers (knob drag, jack
+patching including mult jacks, step selection, computer keys).
 
 ## Next steps
 
-- 16-step sequencer (the hardware's other half; the arp ships first).
-- Presets (save/load patches + knob states).
-- MIDI input (currently computer keyboard + on-screen keys only).
+- Song mode / longer sequences (the hardware holds 256-note sequences).
+- Preset names (slots are numbered today).
+- MIDI clock sync.
+- MIDI output.

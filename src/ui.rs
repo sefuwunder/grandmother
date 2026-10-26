@@ -11,6 +11,7 @@ use crate::font::{draw_text, text_width};
 use crate::lfo::LfoWave;
 use crate::osc::Wave;
 use crate::patch::{Dst, Src, IN_JACKS, MULT_JACKS, OUT_JACKS};
+use crate::presets::{PresetData, PresetStore};
 use crate::voice::{ParamId, Params, Synth};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
@@ -18,7 +19,7 @@ use sdl2::render::{Canvas, RenderTarget};
 use std::collections::{HashMap, HashSet};
 
 pub const W: u32 = 1160;
-pub const H: u32 = 900;
+pub const H: u32 = 1020;
 
 const PANEL: Color = Color::RGB(232, 228, 218);
 const INK: Color = Color::RGB(30, 30, 34);
@@ -120,6 +121,8 @@ pub fn all_knobs() -> Vec<KnobDef> {
         // UTILITIES (drawn on the patch bay, beside the mult)
         knob(ParamId::Att, "ATT", 560, 732, -1.0, 1.0, false),
         knob(ParamId::HpCutoff, "HP CUTOFF", 680, 732, 20.0, 12000.0, true),
+        // SEQUENCER
+        knob(ParamId::SeqRate, "SEQ RATE", 640, 812, 1.0, 16.0, true),
     ]
 }
 
@@ -136,6 +139,13 @@ pub enum BtnKind {
     ArpOct,
     Clear,
     Demo,
+    SeqPlay,
+    SeqRec,
+    SeqGate,
+    SeqAccent,
+    SeqClear,
+    PresetSlot(u8),
+    PresetSave,
 }
 
 #[derive(Clone, Copy)]
@@ -148,7 +158,7 @@ pub struct BtnDef {
 }
 
 pub fn buttons() -> Vec<BtnDef> {
-    vec![
+    let base = vec![
         BtnDef { kind: BtnKind::Osc1Wave, x: 36, y: 96, w: 150, h: 26 },
         BtnDef { kind: BtnKind::Osc1Oct, x: 36, y: 126, w: 150, h: 26 },
         BtnDef { kind: BtnKind::Osc2Wave, x: 234, y: 96, w: 150, h: 26 },
@@ -160,7 +170,24 @@ pub fn buttons() -> Vec<BtnDef> {
         BtnDef { kind: BtnKind::ArpOct, x: 340, y: 330, w: 56, h: 26 },
         BtnDef { kind: BtnKind::Clear, x: 962, y: 10, w: 80, h: 26 },
         BtnDef { kind: BtnKind::Demo, x: 1050, y: 10, w: 80, h: 26 },
-    ]
+        BtnDef { kind: BtnKind::SeqPlay, x: 230, y: 776, w: 64, h: 26 },
+        BtnDef { kind: BtnKind::SeqRec, x: 302, y: 776, w: 56, h: 26 },
+        BtnDef { kind: BtnKind::SeqGate, x: 366, y: 776, w: 64, h: 26 },
+        BtnDef { kind: BtnKind::SeqAccent, x: 438, y: 776, w: 76, h: 26 },
+        BtnDef { kind: BtnKind::SeqClear, x: 522, y: 776, w: 64, h: 26 },
+        BtnDef { kind: BtnKind::PresetSave, x: 896, y: 10, w: 56, h: 26 },
+    ];
+    let mut all = base;
+    for i in 0..8u8 {
+        all.push(BtnDef {
+            kind: BtnKind::PresetSlot(i),
+            x: 584 + i as i32 * 38,
+            y: 10,
+            w: 34,
+            h: 26,
+        });
+    }
+    all
 }
 
 pub struct JackPos {
@@ -209,7 +236,7 @@ pub fn key_rects() -> (Vec<(u8, Rect)>, Vec<(u8, Rect)>) {
     // Two octaves, C3 (48) .. B4 (71). White keys span x 16..1136.
     let x0 = 16;
     let white_w = 80;
-    let y0 = 776;
+    let y0 = 898;
     let h = 100;
     let mut whites = Vec::new();
     let mut blacks = Vec::new();
@@ -300,6 +327,10 @@ pub struct UiState {
     pub mouse_notes: HashSet<u8>,
     pub key_notes: HashMap<sdl2::keyboard::Keycode, u8>,
     pub base_octave: i32, // semitone shift for computer keys, default 0
+    pub presets: PresetStore,
+    pub preset_slot: usize,
+    pub preset_msg: String,
+    pub midi_status: String,
 }
 
 impl UiState {
@@ -310,6 +341,10 @@ impl UiState {
             mouse_notes: HashSet::new(),
             key_notes: HashMap::new(),
             base_octave: 0,
+            presets: PresetStore::new(),
+            preset_slot: 0,
+            preset_msg: String::new(),
+            midi_status: "-".to_string(),
         }
     }
 }
@@ -352,6 +387,19 @@ fn mult_jack_at(x: i32, y: i32) -> Option<usize> {
         let p = mult_jack_pos(m);
         (x - p.x).pow(2) + (y - p.y).pow(2) <= 16 * 16
     })
+}
+
+/// Which sequencer step button (if any) is under the point.
+fn step_at(x: i32, y: i32) -> Option<usize> {
+    (0..16).find(|&i| {
+        let bx = 16 + i as i32 * 70;
+        x >= bx && x < bx + 68 && y >= 850 && y < 884
+    })
+}
+
+fn note_name(m: u8) -> String {
+    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    format!("{}{}", names[(m % 12) as usize], m / 12 - 1)
 }
 
 fn next_wave_osc1(w: Wave) -> Wave {
@@ -408,6 +456,19 @@ pub fn press_button(synth: &mut Synth, kind: BtnKind) {
         BtnKind::ArpOn => p.arp_enabled = !p.arp_enabled,
         BtnKind::ArpMode => p.arp_mode = p.arp_mode.next(),
         BtnKind::ArpOct => p.arp_oct = if p.arp_oct >= 3 { 1 } else { p.arp_oct + 1 },
+        BtnKind::SeqPlay => {
+            if synth.voice.seq.playing {
+                synth.voice.seq_stop();
+            } else {
+                synth.voice.seq_play();
+            }
+        }
+        BtnKind::SeqRec => synth.voice.seq.toggle_rec(),
+        BtnKind::SeqGate => synth.voice.seq.toggle_gate(),
+        BtnKind::SeqAccent => synth.voice.seq.toggle_accent(),
+        BtnKind::SeqClear => synth.voice.seq.clear(),
+        // Preset buttons are handled in on_mouse_down (they need UiState).
+        BtnKind::PresetSlot(_) | BtnKind::PresetSave => {}
         BtnKind::Clear => synth.patch.clear(),
         BtnKind::Demo => {
             // A fun starting patch: LFO wobbles the filter, the second
@@ -435,7 +496,26 @@ pub fn on_mouse_down(ui: &mut UiState, synth: &mut Synth, x: i32, y: i32) {
         return;
     }
     if let Some(kind) = button_at(x, y) {
-        press_button(synth, kind);
+        match kind {
+            BtnKind::PresetSlot(i) => {
+                ui.preset_slot = i as usize;
+                if let Some(data) = ui.presets.slots[i as usize].clone() {
+                    data.apply_to(synth);
+                    ui.preset_msg = format!("LOADED SLOT {}", i + 1);
+                } else {
+                    ui.preset_msg = format!("SLOT {} EMPTY", i + 1);
+                }
+            }
+            BtnKind::PresetSave => {
+                let slot = ui.preset_slot;
+                ui.presets.slots[slot] = Some(PresetData::from_synth(synth));
+                ui.preset_msg = match ui.presets.save() {
+                    Ok(()) => format!("SAVED SLOT {}", slot + 1),
+                    Err(_) => "SAVE FAILED".to_string(),
+                };
+            }
+            _ => press_button(synth, kind),
+        }
         return;
     }
     if let Some(o) = out_jack_at(x, y) {
@@ -448,6 +528,10 @@ pub fn on_mouse_down(ui: &mut UiState, synth: &mut Synth, x: i32, y: i32) {
     }
     if let Some(m) = mult_jack_at(x, y) {
         synth.patch.click_mult(m);
+        return;
+    }
+    if let Some(s) = step_at(x, y) {
+        synth.voice.seq.select(s);
         return;
     }
     if let Some(midi) = key_at(x, y) {
@@ -684,12 +768,28 @@ fn button_label(kind: BtnKind, synth: &Synth) -> String {
         BtnKind::ArpOct => format!("OCT {}", p.arp_oct),
         BtnKind::Clear => "CLEAR".to_string(),
         BtnKind::Demo => "DEMO".to_string(),
+        BtnKind::SeqPlay => {
+            if synth.voice.seq.playing {
+                "STOP".to_string()
+            } else {
+                "PLAY".to_string()
+            }
+        }
+        BtnKind::SeqRec => "REC".to_string(),
+        BtnKind::SeqGate => "GATE".to_string(),
+        BtnKind::SeqAccent => "ACCENT".to_string(),
+        BtnKind::SeqClear => "SEQ CLR".to_string(),
+        BtnKind::PresetSlot(i) => format!("{}", i + 1),
+        BtnKind::PresetSave => "SAVE".to_string(),
     }
 }
 
-fn button_on(kind: BtnKind, synth: &Synth) -> bool {
+fn button_on(kind: BtnKind, synth: &Synth, ui: &UiState) -> bool {
     match kind {
         BtnKind::ArpOn => synth.params.arp_enabled,
+        BtnKind::SeqPlay => synth.voice.seq.playing,
+        BtnKind::SeqRec => synth.voice.seq.rec,
+        BtnKind::PresetSlot(i) => ui.preset_slot == i as usize,
         _ => false,
     }
 }
@@ -702,8 +802,11 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
     draw_text(canvas, 16, 8, "GRANDMOTHER", 3, INK);
     draw_text(canvas, 16, 32, "SEMI-MODULAR ANALOG SYNTHESIZER", 1, DIM);
     for b in buttons() {
-        if matches!(b.kind, BtnKind::Clear | BtnKind::Demo) {
-            draw_button(canvas, &b, &button_label(b.kind, synth), false);
+        if matches!(
+            b.kind,
+            BtnKind::Clear | BtnKind::Demo | BtnKind::PresetSlot(_) | BtnKind::PresetSave
+        ) {
+            draw_button(canvas, &b, &button_label(b.kind, synth), button_on(b.kind, synth, ui));
         }
     }
 
@@ -728,6 +831,7 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
     draw_text(canvas, 570, 386, "PATCHED CV INPUTS BREAK THEIR NORMAL, EXCEPT", 1, DIM);
     draw_text(canvas, 570, 402, "CUTOFF + VCA CV, WHICH ADD TO THE NORMAL.", 1, DIM);
     draw_text(canvas, 570, 418, "MULT JACKS ARE BOTH INPUTS AND OUTPUTS; THEY SHARE ONE BUS.", 1, DIM);
+    draw_text(canvas, 570, 434, "SEQ: CLICK STEP TO SELECT; GATE/ACCENT EDIT; REC ENTERS NOTES.", 1, DIM);
 
     // Knobs (utilities live on the bay, drawn there).
     for k in all_knobs() {
@@ -739,10 +843,13 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
 
     // Buttons (non-title)
     for b in buttons() {
-        if matches!(b.kind, BtnKind::Clear | BtnKind::Demo) {
+        if matches!(
+            b.kind,
+            BtnKind::Clear | BtnKind::Demo | BtnKind::PresetSlot(_) | BtnKind::PresetSave
+        ) {
             continue;
         }
-        draw_button(canvas, &b, &button_label(b.kind, synth), button_on(b.kind, synth));
+        draw_button(canvas, &b, &button_label(b.kind, synth), button_on(b.kind, synth, ui));
     }
 
     // Patch bay: two output rows, two input rows, one mult row.
@@ -876,6 +983,38 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
         );
     }
 
+    // Sequencer strip
+    section(canvas, 16, 200, 776, Color::RGB(180, 140, 40), "SEQUENCER");
+    {
+        let seq = &synth.voice.seq;
+        for i in 0..16 {
+            let x = 16 + i as i32 * 70;
+            let step = seq.steps[i];
+            let playing = seq.playing && seq.current == i;
+            fill(canvas, x, 850, 68, 34, if playing { BTN_ON } else { BTN });
+            rect(canvas, x, 850, 68, 34, INK);
+            if seq.selected == i {
+                rect(canvas, x + 2, 852, 64, 30, INK);
+            }
+            let name = if step.gate {
+                format!("{} {}", i + 1, note_name(step.note))
+            } else {
+                format!("{} --", i + 1)
+            };
+            draw_text(
+                canvas,
+                x + (68 - text_width(&name, 1)) / 2,
+                862,
+                &name,
+                1,
+                if step.gate { INK } else { DIM },
+            );
+            if step.accent {
+                circle(canvas, x + 60, 858, 3, KNOB_MARK);
+            }
+        }
+    }
+
     // On-screen keyboard
     let held: HashSet<u8> = synth.voice.held_notes().iter().copied().collect();
     let cur = synth.voice.current_note();
@@ -909,26 +1048,37 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
     }
 
     // Footer status
-    let note_name = match cur {
-        Some(m) => {
-            let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-            format!("{}{}", names[(m % 12) as usize], m / 12 - 1)
-        }
+    let note_name_cur = match cur {
+        Some(m) => note_name(m),
         None => "--".to_string(),
     };
-    let status = format!(
-        "NOTE {}  HELD {}  OCT SHIFT {:+}  CABLES {}  PATCH: {}",
-        note_name,
+    let seq = &synth.voice.seq;
+    let seq_state = if seq.playing {
+        format!("PLAY {}", seq.current + 1)
+    } else if seq.rec {
+        format!("REC {}", seq.selected + 1)
+    } else {
+        "OFF".to_string()
+    };
+    let midi_short: String = ui.midi_status.chars().take(24).collect();
+    let mut status = format!(
+        "NOTE {}  HELD {}  OCT SHIFT {:+}  CABLES {}  SEQ {}  MIDI {}  PATCH: {}",
+        note_name_cur,
         held.len(),
         ui.base_octave / 12,
         synth.patch.cables.len(),
+        seq_state,
+        midi_short,
         if synth.patch.selected.is_some() {
             "PICK AN INPUT"
         } else {
             "READY"
         }
     );
-    draw_text(canvas, 16, 884, &status, 1, DIM);
+    if !ui.preset_msg.is_empty() {
+        status.push_str(&format!("  {}", ui.preset_msg));
+    }
+    draw_text(canvas, 16, 1006, &status, 1, DIM);
 }
 
 #[cfg(test)]
@@ -994,8 +1144,22 @@ mod tests {
 
     #[test]
     fn piano_key_hit_testing() {
-        assert_eq!(key_at(50, 820), Some(48)); // C3 white
-        assert_eq!(key_at(96, 790), Some(49)); // C#3 black straddles the boundary
+        assert_eq!(key_at(50, 940), Some(48)); // C3 white
+        assert_eq!(key_at(96, 910), Some(49)); // C#3 black straddles the boundary
         assert_eq!(key_at(50, 500), None); // above the keyboard
+    }
+
+    #[test]
+    fn step_click_selects_and_seq_buttons_play() {
+        let mut synth = Synth::new(44100.0);
+        let mut ui = UiState::new();
+        on_mouse_down(&mut ui, &mut synth, 16 + 3 * 70 + 34, 867);
+        assert_eq!(synth.voice.seq.selected, 3);
+        press_button(&mut synth, BtnKind::SeqPlay);
+        assert!(synth.voice.seq.playing);
+        press_button(&mut synth, BtnKind::SeqPlay);
+        assert!(!synth.voice.seq.playing);
+        press_button(&mut synth, BtnKind::SeqRec);
+        assert!(synth.voice.seq.rec);
     }
 }

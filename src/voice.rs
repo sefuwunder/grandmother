@@ -22,6 +22,7 @@ use crate::lfo::{Lfo, LfoWave};
 use crate::osc::{cv_to_freq, midi_to_cv, Noise, Osc, Wave};
 use crate::patch::{inp, out, Dst, InKind, PatchBay, Src, IN_KINDS};
 use crate::reverb::Reverb;
+use crate::seq::Seq;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModDest {
@@ -78,9 +79,10 @@ pub enum ParamId {
     ArpRate,
     Att,
     HpCutoff,
+    SeqRate,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Params {
     pub osc1_wave: Wave,
     pub osc1_oct: i32, // semitones: -24, -12, 0, 12
@@ -118,6 +120,7 @@ pub struct Params {
     pub arp_oct: usize,
     pub att: f32,      // bipolar attenuator: -1..1, 0 = silence
     pub hp_cutoff: f32, // Hz, utility high-pass filter
+    pub seq_rate: f32, // steps per second
 }
 
 impl Default for Params {
@@ -159,6 +162,7 @@ impl Default for Params {
             arp_oct: 1,
             att: 0.0,
             hp_cutoff: 500.0,
+            seq_rate: 8.0,
         }
     }
 }
@@ -193,6 +197,7 @@ impl Params {
             ParamId::ArpRate => self.arp_rate,
             ParamId::Att => self.att,
             ParamId::HpCutoff => self.hp_cutoff,
+            ParamId::SeqRate => self.seq_rate,
         }
     }
 
@@ -225,6 +230,7 @@ impl Params {
             ParamId::ArpRate => self.arp_rate = v,
             ParamId::Att => self.att = v,
             ParamId::HpCutoff => self.hp_cutoff = v,
+            ParamId::SeqRate => self.seq_rate = v,
         }
     }
 }
@@ -264,6 +270,11 @@ pub struct Voice {
     lfo: Lfo,
     reverb: Reverb,
     arp: Arp,
+    pub seq: Seq,
+    seq_note: Option<u8>,
+    cur_vel: f32,
+    bend_semi: f32,
+    mod_wheel: f32,
     held: Vec<u8>, // press order
     arp_note: Option<u8>,
     arp_samples: u32,
@@ -310,6 +321,11 @@ impl Voice {
             lfo: Lfo::new(),
             reverb: Reverb::new(sr),
             arp: Arp::new(),
+            seq: Seq::new(),
+            seq_note: None,
+            cur_vel: 1.0,
+            bend_semi: 0.0,
+            mod_wheel: 1.0,
             held: Vec::new(),
             arp_note: None,
             arp_samples: 0,
@@ -345,10 +361,41 @@ impl Voice {
     }
 
     pub fn note_on(&mut self, midi: u8) {
+        self.note_on_vel(midi, 1.0);
+    }
+
+    /// Note on with velocity (MIDI, sequencer accents). While REC is
+    /// armed and the sequencer is stopped, the note is also written
+    /// into the selected step.
+    pub fn note_on_vel(&mut self, midi: u8, vel: f32) {
+        self.seq.record_note(midi);
         if !self.held.contains(&midi) {
             self.held.push(midi);
         }
+        self.cur_vel = vel.clamp(0.0, 1.0);
         self.arp.set_held(&self.held);
+    }
+
+    /// Pitch bend in semitones (MIDI pitch wheel, ±2 by default).
+    pub fn set_bend(&mut self, semi: f32) {
+        self.bend_semi = semi.clamp(-12.0, 12.0);
+    }
+
+    /// Mod wheel 0..1: scales all LFO modulation depths.
+    pub fn set_mod_wheel(&mut self, v: f32) {
+        self.mod_wheel = v.clamp(0.0, 1.0);
+    }
+
+    /// Start sequencer playback from step 0.
+    pub fn seq_play(&mut self) {
+        let (note, vel) = self.seq.play();
+        self.seq_note = note;
+        self.cur_vel = vel;
+    }
+
+    pub fn seq_stop(&mut self) {
+        self.seq.stop();
+        self.seq_note = None;
     }
 
     pub fn note_off(&mut self, midi: u8) {
@@ -361,7 +408,13 @@ impl Voice {
     }
 
     pub fn current_note(&self) -> Option<u8> {
-        self.arp_note.or_else(|| self.held.last().copied())
+        // While the sequencer runs it owns the voice outright — a rest
+        // step silences it rather than falling through to held keys.
+        if self.seq.playing {
+            self.seq_note
+        } else {
+            self.arp_note.or_else(|| self.held.last().copied())
+        }
     }
 
     /// Previous-sample value of a real output jack (feedback-safe).
@@ -476,16 +529,22 @@ impl Voice {
                 self.arp_note = None;
                 self.arp_samples = 0;
             }
+            // Sequencer clock.
+            if let Some((note, vel)) = self.seq.tick(params.seq_rate, self.sr) {
+                self.seq_note = note;
+                self.cur_vel = vel;
+            }
             *s = self.sample(params, patch);
         }
     }
 
     fn sample(&mut self, params: &Params, patch: &PatchBay) -> f32 {
-        // (a) Note and keyboard CV/gate/velocity. Computer keys have no
-        // velocity, so KB VEL is 1 while any note is held, else 0.
+        // (a) Note and keyboard CV/gate/velocity. KB VEL is the velocity
+        // of the sounding note (keys 1.0, MIDI as played, sequencer
+        // accents 1.0 / plain steps 0.7), else 0.
         let cur_note = self.current_note();
         let kb_gate = cur_note.is_some();
-        let kb_vel = if kb_gate { 1.0 } else { 0.0 };
+        let kb_vel = if kb_gate { self.cur_vel } else { 0.0 };
         let kb_cv = match cur_note {
             Some(n) => {
                 let cv = midi_to_cv(n);
@@ -612,12 +671,15 @@ impl Voice {
             self.glide_cv2 = target2;
         }
         let mod_pitch = if params.mod_dest == ModDest::Pitch {
-            lfo_val * params.mod_amt
+            lfo_val * params.mod_amt * self.mod_wheel
         } else {
             0.0
         };
         let freq1 = cv_to_freq(
-            self.glide_cv1 + (params.osc1_oct as f32 + params.osc1_fine) / 12.0 + mod_pitch,
+            self.glide_cv1
+                + (params.osc1_oct as f32 + params.osc1_fine) / 12.0
+                + mod_pitch
+                + self.bend_semi / 12.0,
         );
         let lin_fm = if IN_KINDS[inp::LIN_FM_IN] == InKind::Additive {
             self.sum_into(patch, Dst::In(inp::LIN_FM_IN), |s| {
@@ -627,7 +689,10 @@ impl Voice {
             0.0
         };
         let freq2 = (cv_to_freq(
-            self.glide_cv2 + (params.osc2_oct as f32 + params.osc2_fine) / 12.0 + mod_pitch,
+            self.glide_cv2
+                + (params.osc2_oct as f32 + params.osc2_fine) / 12.0
+                + mod_pitch
+                + self.bend_semi / 12.0,
         ) + lin_fm * 100.0)
             .max(1.0);
 
@@ -640,7 +705,7 @@ impl Voice {
             }
         };
         let mod_pw = if params.mod_dest == ModDest::Pw {
-            lfo_val * params.mod_amt * 0.4
+            lfo_val * params.mod_amt * 0.4 * self.mod_wheel
         } else {
             0.0
         };
@@ -711,7 +776,7 @@ impl Voice {
 
         // Cutoff: base x KB track x filter EG x additive CV x mod.
         let mod_cut = if params.mod_dest == ModDest::Filter {
-            lfo_val * params.mod_amt * 2.0
+            lfo_val * params.mod_amt * 2.0 * self.mod_wheel
         } else {
             0.0
         };
@@ -1036,5 +1101,60 @@ mod tests {
             max_diff(&plain, &stepped) > 0.01,
             "S/H into cutoff should change the sound"
         );
+    }
+
+    #[test]
+    fn sequencer_playback_drives_notes() {
+        let p = Params::default();
+        let patch = PatchBay::new();
+        let mut v = Voice::new(44100.0);
+        v.seq_play();
+        let mut buf = vec![0.0; 22050];
+        v.render(&p, &patch, &mut buf);
+        assert!(rms(&buf) > 0.01, "playing sequencer should sound");
+    }
+
+    #[test]
+    fn sequencer_rests_silence_and_override_held_keys() {
+        let p = Params::default();
+        let patch = PatchBay::new();
+        let mut v = Voice::new(44100.0);
+        v.seq.clear();
+        v.note_on(60); // held key must NOT leak through a rest pattern
+        v.seq_play();
+        let mut buf = vec![0.0; 22050];
+        v.render(&p, &patch, &mut buf);
+        assert!(
+            buf.iter().all(|&x| x == 0.0),
+            "rest steps must silence the voice, even with held keys"
+        );
+    }
+
+    #[test]
+    fn bend_shifts_pitch() {
+        let p = Params::default();
+        let patch = PatchBay::new();
+        let plain = render_note(&p, &patch, 60, 0.5);
+        let mut v = Voice::new(44100.0);
+        v.note_on(60);
+        v.set_bend(2.0);
+        let mut buf = vec![0.0; 22050];
+        v.render(&p, &patch, &mut buf);
+        assert!(
+            max_diff(&plain, &buf) > 0.05,
+            "a 2-semitone bend should change the sound"
+        );
+    }
+
+    #[test]
+    fn rec_entry_writes_steps_from_played_notes() {
+        let mut v = Voice::new(44100.0);
+        v.seq.toggle_rec();
+        v.note_on(65);
+        v.note_on(69);
+        assert_eq!(v.seq.steps[0].note, 65);
+        assert_eq!(v.seq.steps[1].note, 69);
+        assert!(v.seq.steps[0].gate && v.seq.steps[1].gate);
+        assert_eq!(v.seq.selected, 2);
     }
 }

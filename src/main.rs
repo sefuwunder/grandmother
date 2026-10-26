@@ -14,9 +14,12 @@ mod env;
 mod filter;
 mod font;
 mod lfo;
+mod midi;
 mod osc;
 mod patch;
+mod presets;
 mod reverb;
+mod seq;
 mod ui;
 mod voice;
 mod wav;
@@ -191,7 +194,9 @@ fn run_ui() -> i32 {
             eprintln!("audio unavailable, continuing muted: {e}");
         }
     }
+    let midi_rx = midi::spawn_midi_thread();
     let mut ui_state = ui::UiState::new();
+    ui_state.presets = presets::PresetStore::load();
     let mut pump = match sdl.event_pump() {
         Ok(p) => p,
         Err(e) => {
@@ -241,6 +246,18 @@ fn run_ui() -> i32 {
                 _ => {}
             }
         }
+        // Drain MIDI input events into the instrument.
+        while let Ok(ev) = midi_rx.try_recv() {
+            match &ev {
+                midi::MidiEvent::Connected(name) => ui_state.midi_status = name.clone(),
+                midi::MidiEvent::Disconnected => ui_state.midi_status = "-".to_string(),
+                _ => {
+                    if let Ok(mut s) = shared.lock() {
+                        midi::apply_event(&mut s, &ev);
+                    }
+                }
+            }
+        }
         if let Ok(s) = shared.lock() {
             ui::draw(&mut canvas, &s, &ui_state);
         }
@@ -275,6 +292,8 @@ fn main() {
         println!("  grandmother --smoke [s]   headless render check (default 2s)");
         println!("  grandmother --render [path] [s]  render a demo phrase to WAV");
         println!("  grandmother --shot [path] render the faceplate to a BMP");
+        println!("  MIDI input: first ALSA input port, auto-reconnecting;");
+        println!("    notes, velocity, pitch bend (+/-2 semitones), mod wheel");
         0
     } else {
         run_ui()
