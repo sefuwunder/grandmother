@@ -1,0 +1,11 @@
+[package]
+name = "grandmother"
+version = "0.1.0"
+edition = "2021"
+description = "Grandmother-style semi-modular analog synthesizer in Rust + SDL2: two VCOs, Moog-style ladder filter, dual ADSR, LFO, arpeggiator, spring-style reverb, and a 20-point patch bay with normalized routing"
+
+[dependencies]
+sdl2 = "0.37"
+
+[profile.release]
+opt-level = 3
