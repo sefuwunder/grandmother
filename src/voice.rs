@@ -3,14 +3,24 @@
 //! evaluated per sample, so audio-rate patching (oscillator into filter
 //! cutoff, noise into pitch) works, with a one-sample delay only on
 //! feedback paths (VCF OUT into VCF IN, LFO into its own rate, EG into
-//! pitch) to keep the graph computable.
+//! pitch) to keep the graph computable. The mult bus resolves on
+//! previous-sample values for the same reason, so any mult path —
+//! including feedback through the mult — is stable.
+//!
+//! New in the expanded bay: mixer channel inputs (switched), a patchable
+//! 1-pole high-pass filter and a bipolar attenuator (utilities), an
+//! S/H output sampling noise at each LFO cycle start, keyboard velocity,
+//! oscillator wave outputs, mixer output, inverted envelope, linear FM
+//! into OSC2, LFO sync, envelope trigger (which replaces the keyboard
+//! gate, as on the hardware), a switched VCA audio input, and a switched
+//! reverb audio input.
 
 use crate::arp::{Arp, ArpMode};
 use crate::env::Adsr;
-use crate::filter::Ladder;
+use crate::filter::{Ladder, OnePoleHp};
 use crate::lfo::{Lfo, LfoWave};
 use crate::osc::{cv_to_freq, midi_to_cv, Noise, Osc, Wave};
-use crate::patch::{inp, out, InKind, PatchBay, IN_KINDS};
+use crate::patch::{inp, out, Dst, InKind, PatchBay, Src, IN_KINDS};
 use crate::reverb::Reverb;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,6 +76,8 @@ pub enum ParamId {
     ReverbMix,
     Master,
     ArpRate,
+    Att,
+    HpCutoff,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +116,8 @@ pub struct Params {
     pub arp_mode: ArpMode,
     pub arp_rate: f32, // steps per second
     pub arp_oct: usize,
+    pub att: f32,      // bipolar attenuator: -1..1, 0 = silence
+    pub hp_cutoff: f32, // Hz, utility high-pass filter
 }
 
 impl Default for Params {
@@ -143,6 +157,8 @@ impl Default for Params {
             arp_mode: ArpMode::Up,
             arp_rate: 8.0,
             arp_oct: 1,
+            att: 0.0,
+            hp_cutoff: 500.0,
         }
     }
 }
@@ -175,6 +191,8 @@ impl Params {
             ParamId::ReverbMix => self.reverb_mix,
             ParamId::Master => self.master,
             ParamId::ArpRate => self.arp_rate,
+            ParamId::Att => self.att,
+            ParamId::HpCutoff => self.hp_cutoff,
         }
     }
 
@@ -205,22 +223,34 @@ impl Params {
             ParamId::ReverbMix => self.reverb_mix = v,
             ParamId::Master => self.master = v,
             ParamId::ArpRate => self.arp_rate = v,
+            ParamId::Att => self.att = v,
+            ParamId::HpCutoff => self.hp_cutoff = v,
         }
     }
 }
 
-/// Current-sample signals, for patch resolution after they are computed.
+/// Current-sample signals, threaded through one sample's evaluation.
+/// Fields for signals not yet computed hold previous-sample values.
 struct Cur {
     kb_cv: f32,
     kb_gate: f32,
+    kb_vel: f32,
     lfo: f32,
+    sh: f32,
     feg: f32,
     aeg: f32,
+    neg_env: f32,
     o1saw: f32,
     o1pulse: f32,
+    o1wave: f32,
     o2saw: f32,
     o2tri: f32,
+    o2wave: f32,
     noise: f32,
+    mixer: f32,
+    hp: f32,
+    att: f32,
+    mult: f32,
 }
 
 pub struct Voice {
@@ -228,6 +258,7 @@ pub struct Voice {
     osc2: Osc,
     noise: Noise,
     filter: Ladder,
+    hp: OnePoleHp,
     feg: Adsr,
     aeg: Adsr,
     lfo: Lfo,
@@ -241,17 +272,27 @@ pub struct Voice {
     glide_cv2: f32,
     glide_snap: bool,
     last_cv: f32,
+    sh_val: f32,
+    prev_sync: f32,
     prev_gate: bool,
     prev_note: Option<u8>,
     prev_gate_f32: f32,
     prev_lfo: f32,
     prev_feg: f32,
     prev_aeg: f32,
+    prev_neg_env: f32,
+    prev_kbvel: f32,
+    prev_sh: f32,
     prev_o1saw: f32,
     prev_o1pulse: f32,
+    prev_o1wave: f32,
     prev_o2saw: f32,
     prev_o2tri: f32,
+    prev_o2wave: f32,
     prev_noise: f32,
+    prev_mixer: f32,
+    prev_hp: f32,
+    prev_att: f32,
     prev_vcf: f32,
     sr: f32,
 }
@@ -263,6 +304,7 @@ impl Voice {
             osc2: Osc::new(),
             noise: Noise::new(),
             filter: Ladder::new(sr),
+            hp: OnePoleHp::new(),
             feg: Adsr::new(sr),
             aeg: Adsr::new(sr),
             lfo: Lfo::new(),
@@ -276,17 +318,27 @@ impl Voice {
             glide_cv2: 0.0,
             glide_snap: false,
             last_cv: 2.0,
+            sh_val: 0.0,
+            prev_sync: 0.0,
             prev_gate: false,
             prev_note: None,
             prev_gate_f32: 0.0,
             prev_lfo: 0.0,
             prev_feg: 0.0,
             prev_aeg: 0.0,
+            prev_neg_env: 0.0,
+            prev_kbvel: 0.0,
+            prev_sh: 0.0,
             prev_o1saw: 0.0,
             prev_o1pulse: 0.0,
+            prev_o1wave: 0.0,
             prev_o2saw: 0.0,
             prev_o2tri: 0.0,
+            prev_o2wave: 0.0,
             prev_noise: 0.0,
+            prev_mixer: 0.0,
+            prev_hp: 0.0,
+            prev_att: 0.0,
             prev_vcf: 0.0,
             sr,
         }
@@ -312,8 +364,8 @@ impl Voice {
         self.arp_note.or_else(|| self.held.last().copied())
     }
 
-    /// Previous-sample value of an output jack (feedback-safe reads).
-    fn prev_sig(&self, o: usize) -> f32 {
+    /// Previous-sample value of a real output jack (feedback-safe).
+    fn prev_out(&self, o: usize) -> f32 {
         match o {
             out::KB_CV => self.last_cv,
             out::GATE => self.prev_gate_f32,
@@ -326,12 +378,21 @@ impl Voice {
             out::FILT_EG => self.prev_feg,
             out::AMP_EG => self.prev_aeg,
             out::VCF_OUT => self.prev_vcf,
+            out::KB_VEL => self.prev_kbvel,
+            out::SH_OUT => self.prev_sh,
+            out::OSC1_WAVE => self.prev_o1wave,
+            out::OSC2_WAVE => self.prev_o2wave,
+            out::MIXER_OUT => self.prev_mixer,
+            out::HP_OUT => self.prev_hp,
+            out::ATT_OUT => self.prev_att,
+            out::NEG_ENV => self.prev_neg_env,
             _ => 0.0,
         }
     }
 
     /// Current-sample value where already computed, previous otherwise.
-    fn cur_sig(&self, o: usize, cur: &Cur) -> f32 {
+    /// VCF OUT always reads previous: the filter runs late in the sample.
+    fn cur_out(&self, o: usize, cur: &Cur) -> f32 {
         match o {
             out::KB_CV => cur.kb_cv,
             out::GATE => cur.kb_gate,
@@ -344,13 +405,44 @@ impl Voice {
             out::FILT_EG => cur.feg,
             out::AMP_EG => cur.aeg,
             out::VCF_OUT => self.prev_vcf,
+            out::KB_VEL => cur.kb_vel,
+            out::SH_OUT => cur.sh,
+            out::OSC1_WAVE => cur.o1wave,
+            out::OSC2_WAVE => cur.o2wave,
+            out::MIXER_OUT => cur.mixer,
+            out::HP_OUT => cur.hp,
+            out::ATT_OUT => cur.att,
+            out::NEG_ENV => cur.neg_env,
             _ => 0.0,
         }
     }
 
-    /// Sum of all cables into `inp`, resolving each output with `f`.
-    fn sum_into<F: Fn(usize) -> f32>(&self, patch: &PatchBay, inp: usize, f: F) -> f32 {
-        patch.cables_into(inp).iter().map(|&o| f(o)).sum()
+    fn resolve_prev(&self, src: Src, bus: f32) -> f32 {
+        match src {
+            Src::Out(o) => self.prev_out(o),
+            Src::Mult(_) => bus,
+        }
+    }
+
+    fn resolve_cur(&self, src: Src, cur: &Cur) -> f32 {
+        match src {
+            Src::Out(o) => self.cur_out(o, cur),
+            Src::Mult(_) => cur.mult,
+        }
+    }
+
+    /// Sum of all cables into `dst`, resolving each source with `f`.
+    fn sum_into<F: Fn(Src) -> f32>(&self, patch: &PatchBay, dst: Dst, f: F) -> f32 {
+        let srcs = match dst {
+            Dst::In(i) => patch.sources_into(i),
+            Dst::Mult(m) => patch
+                .cables
+                .iter()
+                .filter(|c| c.dst == Dst::Mult(m))
+                .map(|c| c.src)
+                .collect(),
+        };
+        srcs.iter().map(|&s| f(s)).sum()
     }
 
     pub fn render(&mut self, params: &Params, patch: &PatchBay, out: &mut [f32]) {
@@ -389,9 +481,11 @@ impl Voice {
     }
 
     fn sample(&mut self, params: &Params, patch: &PatchBay) -> f32 {
-        // (a) Note and keyboard CV/gate.
+        // (a) Note and keyboard CV/gate/velocity. Computer keys have no
+        // velocity, so KB VEL is 1 while any note is held, else 0.
         let cur_note = self.current_note();
         let kb_gate = cur_note.is_some();
+        let kb_vel = if kb_gate { 1.0 } else { 0.0 };
         let kb_cv = match cur_note {
             Some(n) => {
                 let cv = midi_to_cv(n);
@@ -401,34 +495,72 @@ impl Voice {
             None => self.last_cv,
         };
 
-        // (b) LFO, with its rate modulated by patched CV (previous-sample
-        // values, so LFO-into-its-own-rate is a stable feedback path).
-        let rate_cv = if patch.patched(inp::LFO_RATE) {
-            self.sum_into(patch, inp::LFO_RATE, |o| self.prev_sig(o))
-        } else {
-            0.0
-        };
-        self.lfo.rate = (params.lfo_rate * 2.0f32.powf(rate_cv)).clamp(0.01, 200.0);
-        let lfo_val = self.lfo.next(self.sr);
+        // Noise is generated early so the S/H output can sample it at
+        // the LFO cycle start below.
+        let noise_val = self.noise.next();
 
-        // (c) Effective gate: patched GATE IN replaces the keyboard gate.
-        let gate = if patch.patched(inp::GATE_IN) {
-            let cur = Cur {
-                kb_cv,
-                kb_gate: if kb_gate { 1.0 } else { 0.0 },
-                lfo: lfo_val,
-                feg: self.prev_feg,
-                aeg: self.prev_aeg,
-                o1saw: self.prev_o1saw,
-                o1pulse: self.prev_o1pulse,
-                o2saw: self.prev_o2saw,
-                o2tri: self.prev_o2tri,
-                noise: self.prev_noise,
-            };
-            // Gate sources resolve against the current keyboard/LFO and
-            // previous-sample everything else.
-            let g = self.sum_into(patch, inp::GATE_IN, |o| self.cur_sig(o, &cur));
-            g > 0.5
+        // Mult bus: previous-sample values of every output patched into
+        // any mult jack, summed. One shared bus for all four jacks.
+        let mult_bus: f32 = patch
+            .mult_sources()
+            .iter()
+            .map(|&o| self.prev_out(o))
+            .sum();
+
+        // (b) LFO rate (patched CV, previous-sample values so LFO-into-
+        // its-own-rate is stable), sync (rising edge resets the phase),
+        // and the S/H sample at each cycle start.
+        let rate_cv = self.sum_into(patch, Dst::In(inp::LFO_RATE), |s| {
+            self.resolve_prev(s, mult_bus)
+        });
+        self.lfo.rate = (params.lfo_rate * 2.0f32.powf(rate_cv)).clamp(0.01, 200.0);
+        let sync = self.sum_into(patch, Dst::In(inp::SYNC_IN), |s| {
+            self.resolve_prev(s, mult_bus)
+        });
+        if sync >= 0.5 && self.prev_sync < 0.5 {
+            self.lfo.reset();
+        }
+        self.prev_sync = sync;
+        let lfo_val = self.lfo.next(self.sr);
+        if self.lfo.wrapped() {
+            self.sh_val = noise_val;
+        }
+
+        // Threaded current-sample signals; not-yet-computed fields hold
+        // previous-sample values.
+        let mut cur = Cur {
+            kb_cv,
+            kb_gate: if kb_gate { 1.0 } else { 0.0 },
+            kb_vel,
+            lfo: lfo_val,
+            sh: self.sh_val,
+            feg: self.prev_feg,
+            aeg: self.prev_aeg,
+            neg_env: self.prev_neg_env,
+            o1saw: self.prev_o1saw,
+            o1pulse: self.prev_o1pulse,
+            o1wave: self.prev_o1wave,
+            o2saw: self.prev_o2saw,
+            o2tri: self.prev_o2tri,
+            o2wave: self.prev_o2wave,
+            noise: noise_val,
+            mixer: self.prev_mixer,
+            hp: self.prev_hp,
+            att: self.prev_att,
+            mult: mult_bus,
+        };
+
+        // (c) Effective gate, precedence: TRIG IN (patched trigger
+        // replaces the keyboard gate, as on the hardware) > GATE IN
+        // (variant override) > keyboard gate.
+        let gate = if patch.patched(inp::TRIG_IN) {
+            self.sum_into(patch, Dst::In(inp::TRIG_IN), |s| {
+                self.resolve_cur(s, &cur)
+            }) > 0.5
+        } else if patch.patched(inp::GATE_IN) {
+            self.sum_into(patch, Dst::In(inp::GATE_IN), |s| {
+                self.resolve_cur(s, &cur)
+            }) > 0.5
         } else {
             kb_gate
         };
@@ -452,24 +584,15 @@ impl Voice {
         self.arp_retrigger = false;
         let feg_val = self.feg.next();
         let aeg_val = self.aeg.next();
+        cur.feg = feg_val;
+        cur.aeg = aeg_val;
+        cur.neg_env = -aeg_val;
 
-        // (e) Oscillator pitch CVs (patched CV replaces the KB normal for
-        // switched inputs), glide, and modulation.
+        // (e) Oscillator pitch CVs (patched CV replaces the KB normal
+        // for switched inputs), glide, modulation, and linear FM.
         let pitch_cv = |this: &Voice, osc: usize| -> f32 {
             if patch.patched(osc) {
-                let cur = Cur {
-                    kb_cv,
-                    kb_gate: if kb_gate { 1.0 } else { 0.0 },
-                    lfo: lfo_val,
-                    feg: feg_val,
-                    aeg: aeg_val,
-                    o1saw: this.prev_o1saw,
-                    o1pulse: this.prev_o1pulse,
-                    o2saw: this.prev_o2saw,
-                    o2tri: this.prev_o2tri,
-                    noise: this.prev_noise,
-                };
-                this.sum_into(patch, osc, |o| this.cur_sig(o, &cur))
+                this.sum_into(patch, Dst::In(osc), |s| this.resolve_cur(s, &cur))
             } else {
                 kb_cv
             }
@@ -496,26 +619,22 @@ impl Voice {
         let freq1 = cv_to_freq(
             self.glide_cv1 + (params.osc1_oct as f32 + params.osc1_fine) / 12.0 + mod_pitch,
         );
-        let freq2 = cv_to_freq(
+        let lin_fm = if IN_KINDS[inp::LIN_FM_IN] == InKind::Additive {
+            self.sum_into(patch, Dst::In(inp::LIN_FM_IN), |s| {
+                self.resolve_cur(s, &cur)
+            })
+        } else {
+            0.0
+        };
+        let freq2 = (cv_to_freq(
             self.glide_cv2 + (params.osc2_oct as f32 + params.osc2_fine) / 12.0 + mod_pitch,
-        );
+        ) + lin_fm * 100.0)
+            .max(1.0);
 
-        // (f) Pulse widths, oscillator advance, mixer inputs.
+        // (f) Pulse widths, oscillator advance, wave outputs.
         let pw_cv = |this: &Voice, inp_idx: usize| -> f32 {
             if patch.patched(inp_idx) {
-                let cur = Cur {
-                    kb_cv,
-                    kb_gate: if kb_gate { 1.0 } else { 0.0 },
-                    lfo: lfo_val,
-                    feg: feg_val,
-                    aeg: aeg_val,
-                    o1saw: this.prev_o1saw,
-                    o1pulse: this.prev_o1pulse,
-                    o2saw: this.prev_o2saw,
-                    o2tri: this.prev_o2tri,
-                    noise: this.prev_noise,
-                };
-                this.sum_into(patch, inp_idx, |o| this.cur_sig(o, &cur))
+                this.sum_into(patch, Dst::In(inp_idx), |s| this.resolve_cur(s, &cur))
             } else {
                 0.0
             }
@@ -535,60 +654,120 @@ impl Voice {
         let o2tri = crate::osc::triangle(self.osc2.phase);
         let o1sel = self.osc1.output(params.osc1_wave, pw1);
         let o2sel = self.osc2.output(params.osc2_wave, pw2);
-        let noise_val = self.noise.next();
+        cur.o1saw = o1saw;
+        cur.o1pulse = o1pulse;
+        cur.o1wave = o1sel;
+        cur.o2saw = o2saw;
+        cur.o2tri = o2tri;
+        cur.o2wave = o2sel;
 
-        let cur = Cur {
-            kb_cv,
-            kb_gate: if kb_gate { 1.0 } else { 0.0 },
-            lfo: lfo_val,
-            feg: feg_val,
-            aeg: aeg_val,
-            o1saw,
-            o1pulse,
-            o2saw,
-            o2tri,
-            noise: noise_val,
-        };
-
-        // (g) Mixer -> VCF input (patched audio replaces the mixer normal).
-        let mix = o1sel * params.osc1_level + o2sel * params.osc2_level + noise_val * params.noise_level;
-        let vcf_in = if patch.patched(inp::VCF_IN) {
-            self.sum_into(patch, inp::VCF_IN, |o| self.cur_sig(o, &cur))
+        // (g) Mixer: each channel's input is switched — a patched cable
+        // replaces the normalled source, the level knob still scales it.
+        let ch1 = if patch.patched(inp::MIX_OSC1) {
+            self.sum_into(patch, Dst::In(inp::MIX_OSC1), |s| {
+                self.resolve_cur(s, &cur)
+            })
         } else {
-            mix
+            o1sel
+        };
+        let ch2 = if patch.patched(inp::MIX_OSC2) {
+            self.sum_into(patch, Dst::In(inp::MIX_OSC2), |s| {
+                self.resolve_cur(s, &cur)
+            })
+        } else {
+            o2sel
+        };
+        let ch3 = if patch.patched(inp::MIX_NOISE) {
+            self.sum_into(patch, Dst::In(inp::MIX_NOISE), |s| {
+                self.resolve_cur(s, &cur)
+            })
+        } else {
+            noise_val
+        };
+        let mixer_out = ch1 * params.osc1_level + ch2 * params.osc2_level + ch3 * params.noise_level;
+        cur.mixer = mixer_out;
+
+        // (g2) Utilities: high-pass filter and bipolar attenuator. Both
+        // are standalone — no normals — so an unpatched input yields 0.
+        let hp_in = self.sum_into(patch, Dst::In(inp::HP_IN), |s| {
+            self.resolve_cur(s, &cur)
+        });
+        let hp_out = self.hp.process(hp_in, params.hp_cutoff, self.sr);
+        let att_in = self.sum_into(patch, Dst::In(inp::ATT_IN), |s| {
+            self.resolve_cur(s, &cur)
+        });
+        let att_out = att_in * params.att;
+        cur.hp = hp_out;
+        cur.att = att_out;
+
+        // (h) VCF input (patched audio replaces the mixer normal).
+        let vcf_in = if patch.patched(inp::VCF_IN) {
+            self.sum_into(patch, Dst::In(inp::VCF_IN), |s| {
+                self.resolve_cur(s, &cur)
+            })
+        } else {
+            mixer_out
         };
 
-        // (h) Cutoff: base x KB track x filter EG x additive CV x mod.
+        // Cutoff: base x KB track x filter EG x additive CV x mod.
         let mod_cut = if params.mod_dest == ModDest::Filter {
             lfo_val * params.mod_amt * 2.0
         } else {
             0.0
         };
         let add_cut = if IN_KINDS[inp::VCF_CUTOFF] == InKind::Additive && patch.patched(inp::VCF_CUTOFF) {
-            self.sum_into(patch, inp::VCF_CUTOFF, |o| self.cur_sig(o, &cur))
+            self.sum_into(patch, Dst::In(inp::VCF_CUTOFF), |s| {
+                self.resolve_cur(s, &cur)
+            })
         } else {
             0.0
         };
+        let env_amt_eff = if IN_KINDS[inp::ENV_AMT] == InKind::Additive && patch.patched(inp::ENV_AMT) {
+            (params.env_amt
+                + self.sum_into(patch, Dst::In(inp::ENV_AMT), |s| {
+                    self.resolve_cur(s, &cur)
+                }))
+            .clamp(-1.0, 1.0)
+        } else {
+            params.env_amt
+        };
         let cutoff = (params.cutoff
             * 2.0f32.powf(params.kb_track * kb_cv)
-            * 2.0f32.powf(feg_val * params.env_amt * 2.0)
+            * 2.0f32.powf(feg_val * env_amt_eff * 2.0)
             * 2.0f32.powf(add_cut)
             * 2.0f32.powf(mod_cut))
         .clamp(20.0, 18000.0);
         self.filter.cutoff = cutoff;
         let vcf_out = self.filter.process(vcf_in);
 
-        // (i) VCA: amp EG plus additive CV, clamped.
+        // (i) VCA: switched audio input (filter normal), amp EG plus
+        // additive CV, clamped.
+        let vca_input = if patch.patched(inp::VCA_IN) {
+            self.sum_into(patch, Dst::In(inp::VCA_IN), |s| {
+                self.resolve_cur(s, &cur)
+            })
+        } else {
+            vcf_out
+        };
         let add_vca = if IN_KINDS[inp::VCA_CV] == InKind::Additive && patch.patched(inp::VCA_CV) {
-            self.sum_into(patch, inp::VCA_CV, |o| self.cur_sig(o, &cur))
+            self.sum_into(patch, Dst::In(inp::VCA_CV), |s| {
+                self.resolve_cur(s, &cur)
+            })
         } else {
             0.0
         };
         let vca_level = (aeg_val + add_vca).clamp(0.0, 1.0);
-        let vca = vcf_out * vca_level;
+        let vca = vca_input * vca_level;
 
-        // (j) Reverb + master with soft clipping.
-        let wet = self.reverb.process(vca);
+        // (j) Reverb: switched audio input (VCA normal) + master.
+        let reverb_input = if patch.patched(inp::REVERB_IN) {
+            self.sum_into(patch, Dst::In(inp::REVERB_IN), |s| {
+                self.resolve_cur(s, &cur)
+            })
+        } else {
+            vca
+        };
+        let wet = self.reverb.process(reverb_input);
         let mixed = vca * (1.0 - params.reverb_mix) + wet * params.reverb_mix;
         let out_sample = (mixed * params.master * 1.5).tanh() / 0.9051;
 
@@ -596,11 +775,19 @@ impl Voice {
         self.prev_lfo = lfo_val;
         self.prev_feg = feg_val;
         self.prev_aeg = aeg_val;
+        self.prev_neg_env = -aeg_val;
+        self.prev_kbvel = kb_vel;
+        self.prev_sh = self.sh_val;
         self.prev_o1saw = o1saw;
         self.prev_o1pulse = o1pulse;
+        self.prev_o1wave = o1sel;
         self.prev_o2saw = o2saw;
         self.prev_o2tri = o2tri;
+        self.prev_o2wave = o2sel;
         self.prev_noise = noise_val;
+        self.prev_mixer = mixer_out;
+        self.prev_hp = hp_out;
+        self.prev_att = att_out;
         self.prev_vcf = vcf_out;
         self.prev_gate = gate;
         self.prev_gate_f32 = if gate { 1.0 } else { 0.0 };
@@ -636,10 +823,17 @@ impl Synth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::{out as o, PatchBay};
+    use crate::patch::{out as o, Cable, Dst, PatchBay, Src};
 
     fn rms(buf: &[f32]) -> f32 {
         (buf.iter().map(|x| x * x).sum::<f32>() / buf.len() as f32).sqrt()
+    }
+
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     fn render_note(params: &Params, patch: &PatchBay, note: u8, secs: f32) -> Vec<f32> {
@@ -687,20 +881,18 @@ mod tests {
         let p = Params::default();
         let plain = render_note(&p, &PatchBay::new(), 60, 0.5);
         let mut patch = PatchBay::new();
-        patch.cables.push(crate::patch::Cable {
-            out: o::LFO,
-            inp: inp::VCF_CUTOFF,
+        patch.cables.push(Cable {
+            src: Src::Out(o::LFO),
+            dst: Dst::In(inp::VCF_CUTOFF),
         });
         let mut p2 = Params::default();
         p2.lfo_rate = 5.0;
         p2.mod_amt = 0.0;
         let patched = render_note(&p2, &patch, 60, 0.5);
-        let diff = plain
-            .iter()
-            .zip(patched.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(diff > 0.01, "LFO->cutoff should change the sound, max diff {diff}");
+        assert!(
+            max_diff(&plain, &patched) > 0.01,
+            "LFO->cutoff should change the sound"
+        );
     }
 
     #[test]
@@ -709,13 +901,140 @@ mod tests {
         p.lfo_wave = LfoWave::Square;
         p.lfo_rate = 5.0;
         let mut patch = PatchBay::new();
-        patch.cables.push(crate::patch::Cable {
-            out: o::LFO,
-            inp: inp::GATE_IN,
+        patch.cables.push(Cable {
+            src: Src::Out(o::LFO),
+            dst: Dst::In(inp::GATE_IN),
         });
         let mut v = Voice::new(44100.0);
         let mut buf = vec![0.0; 44100];
         v.render(&p, &patch, &mut buf);
         assert!(rms(&buf) > 0.01, "patched gate should trigger, rms {}", rms(&buf));
+    }
+
+    #[test]
+    fn mult_routes_signal() {
+        let plain = render_note(&Params::default(), &PatchBay::new(), 60, 0.5);
+        let mut patch = PatchBay::new();
+        patch.cables.push(Cable {
+            src: Src::Out(o::LFO),
+            dst: Dst::Mult(0),
+        });
+        patch.cables.push(Cable {
+            src: Src::Mult(2),
+            dst: Dst::In(inp::VCF_CUTOFF),
+        });
+        let mut p = Params::default();
+        p.lfo_rate = 5.0;
+        p.mod_amt = 0.0;
+        let routed = render_note(&p, &patch, 60, 0.5);
+        assert!(
+            max_diff(&plain, &routed) > 0.01,
+            "LFO->mult->cutoff should change the sound"
+        );
+    }
+
+    #[test]
+    fn trigger_in_drives_envelopes_without_keys() {
+        let mut p = Params::default();
+        p.lfo_wave = LfoWave::Square;
+        p.lfo_rate = 5.0;
+        let mut patch = PatchBay::new();
+        patch.cables.push(Cable {
+            src: Src::Out(o::LFO),
+            dst: Dst::In(inp::TRIG_IN),
+        });
+        let mut v = Voice::new(44100.0);
+        let mut buf = vec![0.0; 44100];
+        v.render(&p, &patch, &mut buf);
+        assert!(rms(&buf) > 0.01, "patched trigger should sound, rms {}", rms(&buf));
+    }
+
+    #[test]
+    fn mixer_channel_in_replaces_normal() {
+        let mut p = Params::default();
+        p.reverb_mix = 0.0;
+        p.osc1_level = 1.0;
+        p.osc2_level = 0.0;
+        p.noise_level = 0.0;
+        let plain = render_note(&p, &PatchBay::new(), 60, 0.5);
+        let mut patch = PatchBay::new();
+        patch.cables.push(Cable {
+            src: Src::Out(o::NOISE),
+            dst: Dst::In(inp::MIX_OSC1),
+        });
+        let replaced = render_note(&p, &patch, 60, 0.5);
+        assert!(
+            max_diff(&plain, &replaced) > 0.05,
+            "noise into MIX OSC1 should replace the saw"
+        );
+    }
+
+    #[test]
+    fn vca_in_replaces_filter_output() {
+        let mut p = Params::default();
+        p.reverb_mix = 0.0;
+        let plain = render_note(&p, &PatchBay::new(), 60, 0.5);
+        let mut patch = PatchBay::new();
+        patch.cables.push(Cable {
+            src: Src::Out(o::NOISE),
+            dst: Dst::In(inp::VCA_IN),
+        });
+        let replaced = render_note(&p, &patch, 60, 0.5);
+        assert!(
+            max_diff(&plain, &replaced) > 0.05,
+            "noise into VCA IN should replace the filtered saw"
+        );
+    }
+
+    #[test]
+    fn attenuator_scales_and_mutes() {
+        let mut p = Params::default();
+        p.lfo_rate = 5.0;
+        p.mod_amt = 0.0;
+        let plain = render_note(&p, &PatchBay::new(), 60, 0.5);
+        let mut patch = PatchBay::new();
+        patch.cables.push(Cable {
+            src: Src::Out(o::LFO),
+            dst: Dst::In(inp::ATT_IN),
+        });
+        patch.cables.push(Cable {
+            src: Src::Out(o::ATT_OUT),
+            dst: Dst::In(inp::VCF_CUTOFF),
+        });
+        // Attenuator at 0: the LFO never reaches the cutoff.
+        let mut p0 = p.clone();
+        p0.att = 0.0;
+        let muted = render_note(&p0, &patch, 60, 0.5);
+        assert!(
+            max_diff(&plain, &muted) < 0.001,
+            "att 0 should pass nothing, diff {}",
+            max_diff(&plain, &muted)
+        );
+        // Attenuator open: the LFO wobbles the cutoff.
+        let mut p1 = p.clone();
+        p1.att = 1.0;
+        let open = render_note(&p1, &patch, 60, 0.5);
+        assert!(
+            max_diff(&plain, &open) > 0.01,
+            "att 1 should pass the LFO to the cutoff"
+        );
+    }
+
+    #[test]
+    fn sh_out_steps_the_cutoff() {
+        let plain = render_note(&Params::default(), &PatchBay::new(), 60, 0.5);
+        let mut patch = PatchBay::new();
+        patch.cables.push(Cable {
+            src: Src::Out(o::SH_OUT),
+            dst: Dst::In(inp::VCF_CUTOFF),
+        });
+        let mut p = Params::default();
+        p.lfo_rate = 5.0;
+        p.mod_amt = 0.0;
+        let stepped = render_note(&p, &patch, 60, 0.5);
+        assert!(
+            max_diff(&plain, &stepped) > 0.01,
+            "S/H into cutoff should change the sound"
+        );
     }
 }

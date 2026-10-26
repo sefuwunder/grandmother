@@ -10,7 +10,7 @@
 use crate::font::{draw_text, text_width};
 use crate::lfo::LfoWave;
 use crate::osc::Wave;
-use crate::patch::{IN_JACKS, OUT_JACKS};
+use crate::patch::{Dst, Src, IN_JACKS, MULT_JACKS, OUT_JACKS};
 use crate::voice::{ParamId, Params, Synth};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
@@ -18,7 +18,7 @@ use sdl2::render::{Canvas, RenderTarget};
 use std::collections::{HashMap, HashSet};
 
 pub const W: u32 = 1160;
-pub const H: u32 = 720;
+pub const H: u32 = 900;
 
 const PANEL: Color = Color::RGB(232, 228, 218);
 const INK: Color = Color::RGB(30, 30, 34);
@@ -117,6 +117,9 @@ pub fn all_knobs() -> Vec<KnobDef> {
         // OUTPUT
         knob(ParamId::Master, "MASTER", 452, 380, 0.0, 1.0, false),
         knob(ParamId::Glide, "GLIDE", 522, 380, 0.0, 0.5, false),
+        // UTILITIES (drawn on the patch bay, beside the mult)
+        knob(ParamId::Att, "ATT", 560, 732, -1.0, 1.0, false),
+        knob(ParamId::HpCutoff, "HP CUTOFF", 680, 732, 20.0, 12000.0, true),
     ]
 }
 
@@ -166,16 +169,39 @@ pub struct JackPos {
 }
 
 pub fn out_jack_pos(i: usize) -> JackPos {
-    JackPos {
-        x: 60 + i as i32 * 104,
-        y: 486,
+    // Two rows: first 10, then the rest.
+    if i < 10 {
+        JackPos {
+            x: 60 + i as i32 * 115,
+            y: 500,
+        }
+    } else {
+        JackPos {
+            x: 90 + (i - 10) as i32 * 121,
+            y: 558,
+        }
     }
 }
 
 pub fn in_jack_pos(i: usize) -> JackPos {
+    // Two rows of 10.
+    if i < 10 {
+        JackPos {
+            x: 60 + i as i32 * 115,
+            y: 616,
+        }
+    } else {
+        JackPos {
+            x: 60 + (i - 10) as i32 * 115,
+            y: 674,
+        }
+    }
+}
+
+pub fn mult_jack_pos(m: usize) -> JackPos {
     JackPos {
-        x: 90 + i as i32 * 121,
-        y: 548,
+        x: 60 + m as i32 * 115,
+        y: 732,
     }
 }
 
@@ -183,7 +209,7 @@ pub fn key_rects() -> (Vec<(u8, Rect)>, Vec<(u8, Rect)>) {
     // Two octaves, C3 (48) .. B4 (71). White keys span x 16..1136.
     let x0 = 16;
     let white_w = 80;
-    let y0 = 588;
+    let y0 = 776;
     let h = 100;
     let mut whites = Vec::new();
     let mut blacks = Vec::new();
@@ -248,7 +274,7 @@ pub fn from_t(t: f32, min: f32, max: f32, log: bool) -> f32 {
 
 pub fn fmt_value(id: ParamId, v: f32) -> String {
     match id {
-        ParamId::Cutoff => {
+        ParamId::Cutoff | ParamId::HpCutoff => {
             if v >= 1000.0 {
                 format!("{:.2}k", v / 1000.0)
             } else {
@@ -259,7 +285,9 @@ pub fn fmt_value(id: ParamId, v: f32) -> String {
         ParamId::ArpRate => format!("{v:.1}"),
         ParamId::Glide | ParamId::FAttack | ParamId::FDecay | ParamId::FRelease
         | ParamId::AAttack | ParamId::ADecay | ParamId::ARelease => format!("{v:.2}s"),
-        ParamId::EnvAmt | ParamId::Osc1Fine | ParamId::Osc2Fine => format!("{v:+.2}"),
+        ParamId::EnvAmt | ParamId::Att | ParamId::Osc1Fine | ParamId::Osc2Fine => {
+            format!("{v:+.2}")
+        }
         _ => format!("{v:.2}"),
     }
 }
@@ -315,6 +343,13 @@ fn out_jack_at(x: i32, y: i32) -> Option<usize> {
 fn in_jack_at(x: i32, y: i32) -> Option<usize> {
     (0..IN_JACKS.len()).find(|&i| {
         let p = in_jack_pos(i);
+        (x - p.x).pow(2) + (y - p.y).pow(2) <= 16 * 16
+    })
+}
+
+fn mult_jack_at(x: i32, y: i32) -> Option<usize> {
+    (0..MULT_JACKS).find(|&m| {
+        let p = mult_jack_pos(m);
         (x - p.x).pow(2) + (y - p.y).pow(2) <= 16 * 16
     })
 }
@@ -379,12 +414,12 @@ pub fn press_button(synth: &mut Synth, kind: BtnKind) {
             // oscillator's triangle drives the filter input directly.
             synth.patch.clear();
             synth.patch.cables.push(crate::patch::Cable {
-                out: crate::patch::out::LFO,
-                inp: crate::patch::inp::VCF_CUTOFF,
+                src: crate::patch::Src::Out(crate::patch::out::LFO),
+                dst: crate::patch::Dst::In(crate::patch::inp::VCF_CUTOFF),
             });
             synth.patch.cables.push(crate::patch::Cable {
-                out: crate::patch::out::OSC2_TRI,
-                inp: crate::patch::inp::VCF_IN,
+                src: crate::patch::Src::Out(crate::patch::out::OSC2_TRI),
+                dst: crate::patch::Dst::In(crate::patch::inp::VCF_IN),
             });
             synth.params.lfo_rate = 6.0;
             synth.params.mod_amt = 0.0;
@@ -409,6 +444,10 @@ pub fn on_mouse_down(ui: &mut UiState, synth: &mut Synth, x: i32, y: i32) {
     }
     if let Some(i) = in_jack_at(x, y) {
         synth.patch.click_in(i);
+        return;
+    }
+    if let Some(m) = mult_jack_at(x, y) {
+        synth.patch.click_mult(m);
         return;
     }
     if let Some(midi) = key_at(x, y) {
@@ -688,9 +727,13 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
     draw_text(canvas, 570, 370, "CLICK AN INPUT WITH NOTHING SELECTED TO UNPATCH.", 1, DIM);
     draw_text(canvas, 570, 386, "PATCHED CV INPUTS BREAK THEIR NORMAL, EXCEPT", 1, DIM);
     draw_text(canvas, 570, 402, "CUTOFF + VCA CV, WHICH ADD TO THE NORMAL.", 1, DIM);
+    draw_text(canvas, 570, 418, "MULT JACKS ARE BOTH INPUTS AND OUTPUTS; THEY SHARE ONE BUS.", 1, DIM);
 
-    // Knobs
+    // Knobs (utilities live on the bay, drawn there).
     for k in all_knobs() {
+        if matches!(k.id, ParamId::Att | ParamId::HpCutoff) {
+            continue;
+        }
         draw_knob(canvas, &k, p);
     }
 
@@ -702,25 +745,43 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
         draw_button(canvas, &b, &button_label(b.kind, synth), button_on(b.kind, synth));
     }
 
-    // Patch bay
-    fill(canvas, 16, 448, 1128, 132, BAY_BG);
+    // Patch bay: two output rows, two input rows, one mult row.
+    fill(canvas, 16, 448, 1128, 320, BAY_BG);
+    fn src_pos(s: Src) -> JackPos {
+        match s {
+            Src::Out(o) => out_jack_pos(o),
+            Src::Mult(m) => mult_jack_pos(m),
+        }
+    }
+    fn dst_pos(d: Dst) -> JackPos {
+        match d {
+            Dst::In(i) => in_jack_pos(i),
+            Dst::Mult(m) => mult_jack_pos(m),
+        }
+    }
+    fn src_color(s: Src) -> Color {
+        match s {
+            Src::Out(o) => cable_color(o),
+            Src::Mult(m) => cable_color(20 + m),
+        }
+    }
     // Cables first (under the jacks).
     for c in &synth.patch.cables {
-        let a = out_jack_pos(c.out);
-        let b = in_jack_pos(c.inp);
-        bezier(canvas, a.x, a.y, b.x, b.y, cable_color(c.out));
+        let a = src_pos(c.src);
+        let b = dst_pos(c.dst);
+        bezier(canvas, a.x, a.y, b.x, b.y, src_color(c.src));
     }
-    // Pending cable from the selected output to the mouse.
-    if let Some(o) = synth.patch.selected_out {
-        let a = out_jack_pos(o);
-        bezier(canvas, a.x, a.y, ui.mouse.0, ui.mouse.1, cable_color(o));
+    // Pending cable from the selected source to the mouse.
+    if let Some(s) = synth.patch.selected {
+        let a = src_pos(s);
+        bezier(canvas, a.x, a.y, ui.mouse.0, ui.mouse.1, src_color(s));
     }
     // Jacks.
     for (i, name) in OUT_JACKS.iter().enumerate() {
         let pos = out_jack_pos(i);
         ring(canvas, pos.x, pos.y, 12, JACK_RING, BAY_BG);
         circle(canvas, pos.x, pos.y, 5, JACK_HOLE);
-        if synth.patch.selected_out == Some(i) {
+        if synth.patch.selected == Some(Src::Out(i)) {
             ring(canvas, pos.x, pos.y, 15, cable_color(i), BAY_BG);
         }
         draw_text(
@@ -737,14 +798,79 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
         ring(canvas, pos.x, pos.y, 12, JACK_RING, BAY_BG);
         circle(canvas, pos.x, pos.y, 5, JACK_HOLE);
         // Color the hole by the first cable into it, if any.
-        if let Some(c) = synth.patch.cables.iter().find(|c| c.inp == i) {
-            circle(canvas, pos.x, pos.y, 4, cable_color(c.out));
+        if let Some(c) = synth.patch.cables.iter().find(|c| c.dst == Dst::In(i)) {
+            circle(canvas, pos.x, pos.y, 4, src_color(c.src));
         }
         draw_text(
             canvas,
             pos.x - text_width(name, 1) / 2,
-            pos.y + 18,
+            pos.y - 28,
             name,
+            1,
+            BAY_LABEL,
+        );
+    }
+    for m in 0..MULT_JACKS {
+        let pos = mult_jack_pos(m);
+        ring(canvas, pos.x, pos.y, 12, JACK_RING, BAY_BG);
+        circle(canvas, pos.x, pos.y, 5, JACK_HOLE);
+        if let Some(c) = synth
+            .patch
+            .cables
+            .iter()
+            .find(|c| c.dst == Dst::Mult(m))
+        {
+            circle(canvas, pos.x, pos.y, 4, src_color(c.src));
+        }
+        if synth.patch.selected == Some(Src::Mult(m)) {
+            ring(canvas, pos.x, pos.y, 15, src_color(Src::Mult(m)), BAY_BG);
+        }
+        let name = format!("MULT {}", m + 1);
+        draw_text(
+            canvas,
+            pos.x - text_width(&name, 1) / 2,
+            pos.y - 28,
+            &name,
+            1,
+            BAY_LABEL,
+        );
+    }
+    draw_text(
+        canvas,
+        720,
+        724,
+        "MULT: CLICK TO SEND, OR CLICK AFTER AN OUTPUT TO RECEIVE",
+        1,
+        BAY_LABEL,
+    );
+    // Utility knobs on the bay, beside the mult.
+    for k in all_knobs() {
+        if !matches!(k.id, ParamId::Att | ParamId::HpCutoff) {
+            continue;
+        }
+        let v = p.get(k.id);
+        let t = to_t(v, k.min, k.max, k.log);
+        draw_text(
+            canvas,
+            k.x - text_width(k.label, 1) / 2,
+            k.y - 32,
+            k.label,
+            1,
+            BAY_LABEL,
+        );
+        circle(canvas, k.x, k.y, 17, KNOB);
+        let ang = -135.0f32 + t * 270.0;
+        let rad = ang.to_radians();
+        let ix = k.x + (rad.sin() * 13.0) as i32;
+        let iy = k.y - (rad.cos() * 13.0) as i32;
+        line(canvas, k.x, k.y, ix, iy, KNOB_MARK);
+        circle(canvas, k.x, k.y, 3, KNOB_MARK);
+        let val = fmt_value(k.id, v);
+        draw_text(
+            canvas,
+            k.x - text_width(&val, 1) / 2,
+            k.y + 22,
+            &val,
             1,
             BAY_LABEL,
         );
@@ -796,13 +922,13 @@ pub fn draw<T: RenderTarget>(canvas: &mut Canvas<T>, synth: &Synth, ui: &UiState
         held.len(),
         ui.base_octave / 12,
         synth.patch.cables.len(),
-        if synth.patch.selected_out.is_some() {
+        if synth.patch.selected.is_some() {
             "PICK AN INPUT"
         } else {
             "READY"
         }
     );
-    draw_text(canvas, 16, 698, &status, 1, DIM);
+    draw_text(canvas, 16, 884, &status, 1, DIM);
 }
 
 #[cfg(test)]
@@ -830,14 +956,30 @@ mod tests {
         let o = out_jack_pos(out::LFO);
         let i = in_jack_pos(inp::VCF_CUTOFF);
         on_mouse_down(&mut ui, &mut synth, o.x, o.y);
-        assert_eq!(synth.patch.selected_out, Some(out::LFO));
+        assert_eq!(synth.patch.selected, Some(crate::patch::Src::Out(out::LFO)));
         on_mouse_down(&mut ui, &mut synth, i.x, i.y);
         assert_eq!(synth.patch.cables.len(), 1);
-        assert_eq!(synth.patch.cables[0].out, out::LFO);
-        assert_eq!(synth.patch.cables[0].inp, inp::VCF_CUTOFF);
+        assert_eq!(
+            synth.patch.cables[0].src,
+            crate::patch::Src::Out(out::LFO)
+        );
+        assert_eq!(
+            synth.patch.cables[0].dst,
+            crate::patch::Dst::In(inp::VCF_CUTOFF)
+        );
         // Unselected click on the same input pops the cable.
         on_mouse_down(&mut ui, &mut synth, i.x, i.y);
         assert!(synth.patch.cables.is_empty());
+        // Mult jack: unselected click selects it as a source.
+        let m = mult_jack_pos(0);
+        on_mouse_down(&mut ui, &mut synth, m.x, m.y);
+        assert_eq!(synth.patch.selected, Some(crate::patch::Src::Mult(0)));
+        on_mouse_down(&mut ui, &mut synth, i.x, i.y);
+        assert_eq!(synth.patch.cables.len(), 1);
+        assert_eq!(
+            synth.patch.cables[0].src,
+            crate::patch::Src::Mult(0)
+        );
     }
 
     #[test]
@@ -852,8 +994,8 @@ mod tests {
 
     #[test]
     fn piano_key_hit_testing() {
-        assert_eq!(key_at(50, 620), Some(48)); // C3 white
-        assert_eq!(key_at(96, 600), Some(49)); // C#3 black straddles the boundary
+        assert_eq!(key_at(50, 820), Some(48)); // C3 white
+        assert_eq!(key_at(96, 790), Some(49)); // C#3 black straddles the boundary
         assert_eq!(key_at(50, 500), None); // above the keyboard
     }
 }

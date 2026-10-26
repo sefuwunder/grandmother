@@ -43,8 +43,8 @@ fn render_phrase(synth: &mut Synth, secs: f32) -> Vec<f32> {
     let mut buf = vec![0.0f32; n];
     // Demo patch: LFO into filter cutoff, for a moving sound.
     synth.patch.cables.push(patch::Cable {
-        out: patch::out::LFO,
-        inp: patch::inp::VCF_CUTOFF,
+        src: patch::Src::Out(patch::out::LFO),
+        dst: patch::Dst::In(patch::inp::VCF_CUTOFF),
     });
     synth.params.lfo_rate = 4.0;
     let notes = [48u8, 55, 60, 64];

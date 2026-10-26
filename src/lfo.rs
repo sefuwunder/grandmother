@@ -15,6 +15,7 @@ pub struct Lfo {
     pub rate: f32,
     pub wave: LfoWave,
     phase: f32,
+    wrapped: bool,
 }
 
 impl Lfo {
@@ -23,12 +24,26 @@ impl Lfo {
             rate: 1.0,
             wave: LfoWave::Triangle,
             phase: 0.0,
+            wrapped: false,
         }
+    }
+
+    /// Reset the phase to the start of the cycle (SYNC IN behavior).
+    pub fn reset(&mut self) {
+        self.phase = 0.0;
+        self.wrapped = false;
+    }
+
+    /// True if the most recent `next()` call wrapped past the end of the
+    /// cycle. The S/H output samples the noise source on this edge.
+    pub fn wrapped(&self) -> bool {
+        self.wrapped
     }
 
     pub fn next(&mut self, sr: f32) -> f32 {
         let p = self.phase;
         self.phase += self.rate / sr;
+        self.wrapped = self.phase >= 1.0;
         self.phase -= self.phase.floor();
         match self.wave {
             LfoWave::Sine => (TAU * p).sin(),

@@ -44,6 +44,31 @@ impl Ladder {
     }
 }
 
+/// One-pole high-pass (the hardware's patchable utility filter, -6 dB/oct):
+/// subtract a one-pole low-pass from the input.
+#[derive(Clone, Debug)]
+pub struct OnePoleHp {
+    lp: f32,
+}
+
+impl OnePoleHp {
+    pub fn new() -> Self {
+        OnePoleHp { lp: 0.0 }
+    }
+
+    pub fn process(&mut self, x: f32, cutoff: f32, sr: f32) -> f32 {
+        let a = 1.0 - (-2.0 * PI * cutoff.max(1.0).min(sr * 0.45) / sr).exp();
+        self.lp += a * (x - self.lp);
+        x - self.lp
+    }
+}
+
+impl Default for OnePoleHp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,7 +98,7 @@ mod tests {
     fn cutoff_sweeps_attenuate_highs() {
         // 5 kHz sine through a 200 Hz filter should be nearly gone;
         // through a 12 kHz filter it should mostly survive.
-        let mut rms = |cutoff: f32| -> f32 {
+        let rms = |cutoff: f32| -> f32 {
             let mut f = Ladder::new(44100.0);
             f.cutoff = cutoff;
             f.reso = 0.0;
@@ -92,5 +117,27 @@ mod tests {
         let high = rms(12000.0);
         assert!(low < 0.05, "200 Hz filter should kill 5 kHz: {low}");
         assert!(high > 0.4, "12 kHz filter should pass 5 kHz: {high}");
+    }
+
+    #[test]
+    fn high_pass_blocks_dc_and_passes_highs() {
+        let mut hp = OnePoleHp::new();
+        let mut y = 0.0;
+        for _ in 0..44100 {
+            y = hp.process(0.5, 1000.0, 44100.0);
+        }
+        assert!(y.abs() < 0.01, "DC should be blocked: {y}");
+        let mut hp = OnePoleHp::new();
+        let mut acc = 0.0f32;
+        let n = 44100;
+        for i in 0..n {
+            let x = (2.0 * PI * 5000.0 * i as f32 / 44100.0).sin();
+            let y = hp.process(x, 1000.0, 44100.0);
+            if i > 4410 {
+                acc += y * y;
+            }
+        }
+        let rms = (acc / (n - 4410) as f32).sqrt();
+        assert!(rms > 0.4, "5 kHz through a 1 kHz HP should mostly pass: {rms}");
     }
 }
